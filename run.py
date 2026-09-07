@@ -13,14 +13,21 @@ from utils import save_report
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Classroom Analytics Pipeline")
-    parser.add_argument('--video', type=str, required=True,
+    parser.add_argument('--video', '--video_path', type=str, required=True, dest='video',
                         help='Path to input video file')
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     parser.add_argument(
-        '--output', type=str, default=f'data/outputs/report_{timestamp}.json', help='Path to output report JSON')
+        '--output', '--output_path', '--output_dir', type=str, dest='output',
+        default=f'data/outputs/report_{timestamp}.json', help='Path to output report JSON')
     parser.add_argument('--sample_fps', type=float, default=None,
                         help='Target frame rate for processing (e.g. 5.0, 10.0, or None for native FPS)')
     parser.add_argument('--max_frames', type=int, default=None,
@@ -40,8 +47,14 @@ def main():
 
     args = parser.parse_args()
 
+    # If output points to a directory, save report.json inside it
+    output_path = args.output
+    if os.path.isdir(output_path) or not output_path.endswith('.json'):
+        os.makedirs(output_path, exist_ok=True)
+        output_path = os.path.join(output_path, f"report_{timestamp}.json")
+
     try:
-        print(f"Initializing pipeline...")
+        print(f"Initializing pipeline...", flush=True)
         pipeline = ClassroomAnalyticsPipeline(
             model_name=args.model,
             device=args.device,
@@ -51,7 +64,7 @@ def main():
                 args.teacher_zone) if args.teacher_zone else None,
         )
 
-        print(f"Running analysis on: {args.video}")
+        print(f"Running analysis on: {args.video}", flush=True)
         report = pipeline.run(
             args.video,
             max_frames=args.max_frames,
@@ -60,7 +73,7 @@ def main():
         )
 
         # Save report
-        save_report(report, args.output)
+        save_report(report, output_path)
 
         # Print summary
         print("\n" + "="*60)

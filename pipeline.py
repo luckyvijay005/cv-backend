@@ -68,7 +68,7 @@ class ClassroomAnalyticsPipeline:
         Returns:
             Report dict with metrics, top-3 students, and interaction timelines
         """
-        print(f"Loading video: {video_path}")
+        print(f"Loading video: {video_path}", flush=True)
         if progress_callback:
             progress_callback("Loading video", 10, "Opening video and reading stream metadata...")
 
@@ -86,7 +86,8 @@ class ClassroomAnalyticsPipeline:
 
         print(
             f"Video: {metadata['width']}x{metadata['height']}, {fps:.1f} FPS (Sampled at ~{effective_fps:.1f} FPS, step={frame_step}), "
-            f"{total_video_frames} frames ({metadata['duration_seconds']:.1f}s)"
+            f"{total_video_frames} frames ({metadata['duration_seconds']:.1f}s)",
+            flush=True
         )
 
         # Track state & in-memory crop caches to avoid slow seeking on AVI files
@@ -97,7 +98,7 @@ class ClassroomAnalyticsPipeline:
         all_frames_tracks = []      # Track assignments per processed frame
         frame_timestamps = []       # Timestamp in seconds for each processed frame
 
-        print("Running detection + ByteTrack tracking...")
+        print("Running detection + ByteTrack tracking...", flush=True)
         self.tracker.reset()
 
         processed_frame_count = 0
@@ -151,6 +152,13 @@ class ClassroomAnalyticsPipeline:
             raw_frame_idx += advance
             pbar.update(advance)
 
+            # Print continuous progress to stdout for Colab logs every 100 sampled frames
+            if processed_frame_count % 100 == 0 or raw_frame_idx >= total_video_frames:
+                pct = (raw_frame_idx / max(1, total_video_frames)) * 100
+                elapsed = time.time() - start_time
+                curr_fps = processed_frame_count / max(0.001, elapsed)
+                print(f"[Progress] Frame {raw_frame_idx:,}/{total_video_frames:,} ({pct:.1f}%) | {curr_fps:.1f} FPS | {len(track_history)} active tracks", flush=True)
+
             # Emit live continuous progress to UI
             if progress_callback and (processed_frame_count % 10 == 0 or raw_frame_idx >= total_video_frames):
                 pct = int(15 + min(1.0, raw_frame_idx / max(1, total_video_frames)) * 55)
@@ -163,7 +171,7 @@ class ClassroomAnalyticsPipeline:
                 )
 
         pbar.close()
-        print(f"Processed {processed_frame_count} sampled frames. Detected {len(track_history)} raw tracklets.")
+        print(f"Processed {processed_frame_count} sampled frames. Detected {len(track_history)} raw tracklets.", flush=True)
 
         # Filter out very short ghost tracks (< 1.5 seconds) first to avoid evaluating noise
         min_track_length = max(3, int(effective_fps * 1.5))
@@ -172,12 +180,12 @@ class ClassroomAnalyticsPipeline:
             for tid, bboxes in track_history.items()
             if len(bboxes) >= min_track_length
         }
-        print(f"Tracklets after ghost filter (>={min_track_length} frames): {len(valid_track_history)}")
+        print(f"Tracklets after ghost filter (>={min_track_length} frames): {len(valid_track_history)}", flush=True)
 
         # Detect teacher tracklets and exclude teacher from student interaction analysis
         teacher_track_ids = self._identify_teacher_tracks(
             valid_track_history, metadata['width'], metadata['height'])
-        print(f"Teacher tracks excluded: {len(teacher_track_ids)} track IDs")
+        print(f"Teacher tracks excluded: {len(teacher_track_ids)} track IDs", flush=True)
 
         student_track_history = {
             tid: bboxes
