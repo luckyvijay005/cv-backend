@@ -59,7 +59,8 @@ class InteractionAnalyzer:
         last_seen_frame = {}
 
         num_processed = len(all_frames_tracks)
-        from tqdm import tqdm
+        thresh_sq = float(self.proximity_threshold_px ** 2)
+
         for frame_idx, frame_tracks in enumerate(all_frames_tracks):
             if not frame_tracks:
                 continue
@@ -69,33 +70,48 @@ class InteractionAnalyzer:
             # Filter to active students in this frame
             active_students = {tid: bbox for tid, bbox in frame_tracks.items() if tid in student_track_history}
             active_tids = list(active_students.keys())
+            if not active_tids:
+                continue
+
+            n_active = len(active_tids)
+            if n_active == 1:
+                tid = active_tids[0]
+                if tid not in first_seen_frame:
+                    first_seen_frame[tid] = current_time
+                last_seen_frame[tid] = current_time
+                isolated_frames[tid] += 1
+                student_state_series[tid].append((current_time, 'isolated'))
+                if prev_near[tid]:
+                    approach_events[tid] += 1
+                prev_near[tid] = False
+                continue
+
+            # Vectorized centroid calculation & pairwise distance matrix
+            boxes = [active_students[tid] for tid in active_tids]
+            centroids = np.array([
+                [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5] for b in boxes
+            ], dtype=np.float32)
+
+            diff = centroids[:, np.newaxis, :] - centroids[np.newaxis, :, :]
+            dist_sq = np.sum(diff ** 2, axis=-1)
+            np.fill_diagonal(dist_sq, np.inf)
+            near_any = np.any(dist_sq < thresh_sq, axis=1)
 
             for i, tid in enumerate(active_tids):
                 if tid not in first_seen_frame:
                     first_seen_frame[tid] = current_time
                 last_seen_frame[tid] = current_time
 
-                bbox = active_students[tid]
-                peers_nearby = False
-                for j, other_tid in enumerate(active_tids):
-                    if i == j:
-                        continue
-                    other_bbox = active_students[other_tid]
-                    dist = self._bbox_distance(bbox, other_bbox)
-                    if dist < self.proximity_threshold_px:
-                        peers_nearby = True
-                        break  # Only need one peer to be 'near_peer'
-
-                if not peers_nearby:
+                if near_any[i]:
+                    near_peer_frames[tid] += 1
+                    student_state_series[tid].append((current_time, 'near_peer'))
+                    prev_near[tid] = True
+                else:
                     isolated_frames[tid] += 1
                     student_state_series[tid].append((current_time, 'isolated'))
                     if prev_near[tid]:
                         approach_events[tid] += 1  # Detected leaving a group
                     prev_near[tid] = False
-                else:
-                    near_peer_frames[tid] += 1
-                    student_state_series[tid].append((current_time, 'near_peer'))
-                    prev_near[tid] = True
 
         # Finalize metrics and condense timelines
         for tid in student_track_history.keys():

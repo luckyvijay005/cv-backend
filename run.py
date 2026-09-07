@@ -21,6 +21,8 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     parser.add_argument(
         '--output', type=str, default=f'data/outputs/report_{timestamp}.json', help='Path to output report JSON')
+    parser.add_argument('--sample_fps', type=float, default=None,
+                        help='Target frame rate for processing (e.g. 5.0, 10.0, or None for native FPS)')
     parser.add_argument('--max_frames', type=int, default=None,
                         help='Max frames to process (for testing)')
     parser.add_argument('--proximity', type=float, default=80.0,
@@ -53,6 +55,7 @@ def main():
         report = pipeline.run(
             args.video,
             max_frames=args.max_frames,
+            sample_fps=args.sample_fps,
             save_viz=args.visualize
         )
 

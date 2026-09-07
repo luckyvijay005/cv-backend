@@ -165,25 +165,31 @@ class ClassroomAnalyticsPipeline:
         pbar.close()
         print(f"Processed {processed_frame_count} sampled frames. Detected {len(track_history)} raw tracklets.")
 
-        # Detect teacher tracklets and exclude teacher from student interaction analysis
-        teacher_track_ids = self._identify_teacher_tracks(
-            track_history, metadata['width'], metadata['height'])
-
-        # Filter out very short ghost tracks (< 1.5 seconds)
+        # Filter out very short ghost tracks (< 1.5 seconds) first to avoid evaluating noise
         min_track_length = max(3, int(effective_fps * 1.5))
-        student_track_history = {
+        valid_track_history = {
             tid: bboxes
             for tid, bboxes in track_history.items()
-            if tid not in teacher_track_ids and len(bboxes) >= min_track_length
+            if len(bboxes) >= min_track_length
         }
+        print(f"Tracklets after ghost filter (>={min_track_length} frames): {len(valid_track_history)}")
 
+        # Detect teacher tracklets and exclude teacher from student interaction analysis
+        teacher_track_ids = self._identify_teacher_tracks(
+            valid_track_history, metadata['width'], metadata['height'])
         print(f"Teacher tracks excluded: {len(teacher_track_ids)} track IDs")
-        print(f"Tracklets after ghost filter (>={min_track_length} frames): {len(student_track_history)}")
+
+        student_track_history = {
+            tid: bboxes
+            for tid, bboxes in valid_track_history.items()
+            if tid not in teacher_track_ids
+        }
 
         # Register students persistently across videos (using in-memory cached crops)
         if progress_callback:
             progress_callback("Registering student profiles", 75, "Matching student appearance descriptors...")
 
+        print(f"Registering student profiles across {len(student_track_history)} tracklets...")
         persistent_map = self.registry.register_tracks(
             frames, student_track_history, track_start_frames, cached_crops=track_crops)
 
@@ -199,11 +205,11 @@ class ClassroomAnalyticsPipeline:
             if sid not in student_history_by_id:
                 student_history_by_id[sid] = []
                 student_start_frames_by_id[sid] = track_start_frames.get(tid, 0)
-                if tid in track_crops:
-                    student_crops_by_id[sid] = track_crops[tid]
             student_history_by_id[sid].extend(bboxes)
             student_start_frames_by_id[sid] = min(
                 student_start_frames_by_id[sid], track_start_frames.get(tid, 0))
+            if tid in track_crops and sid not in student_crops_by_id:
+                student_crops_by_id[sid] = track_crops[tid]
 
         unique_student_count = len(student_history_by_id)
         print(f"Unique persistent students identified: {unique_student_count}")
@@ -307,7 +313,7 @@ class ClassroomAnalyticsPipeline:
         frames.release()
         return report
 
-    def _identify_teacher_tracks(self, track_history: Dict[int, List[Tuple[float, float, float, float]]], frame_width: int, frame_height: int):
+    def _identify_teacher_tracks(self, track_history: Dict[int, List[Tuple[float, float, float, float]]], frame_width: int, frame_height: int) -> set:
         """Identify teacher track IDs using heuristics and optional manual zone."""
         if self.teacher_zone:
             x1, y1, x2, y2 = self.teacher_zone
@@ -325,68 +331,58 @@ class ClassroomAnalyticsPipeline:
         if not track_history:
             return set()
 
+        # Compute average area and centroid for each track
         avg_areas = {}
         avg_centers = {}
         for track_id, bboxes in track_history.items():
             if not bboxes:
                 continue
             areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in bboxes]
-            centers = [((x1 + x2) / 2, (y1 + y2) / 2)
-                       for x1, y1, x2, y2 in bboxes]
-            avg_areas[track_id] = float(sum(areas) / len(areas))
-            avg_centers[track_id] = (
-                float(sum(c[0] for c in centers) / len(centers)),
-                float(sum(c[1] for c in centers) / len(centers)),
-            )
+            centers = [((x1 + x2) * 0.5, (y1 + y2) * 0.5) for x1, y1, x2, y2 in bboxes]
+            avg_areas[track_id] = float(np.mean(areas))
+            avg_centers[track_id] = (float(np.mean([c[0] for c in centers])), float(np.mean([c[1] for c in centers])))
 
-        median_area = float(
-            np.median(list(avg_areas.values()))) if avg_areas else 0.0
-
-        # Teacher is likely the largest person who is separated from the group.
-        candidate_scores = []
-        for track_id, avg_area in avg_areas.items():
-            center_x, center_y = avg_centers[track_id]
-            separation = self._track_separation(track_id, track_history)
-            score = avg_area / (median_area + 1e-3)
-            score += separation * 0.5
-            if avg_area > median_area * 1.4:
-                candidate_scores.append((score, track_id, center_x, center_y))
-
-        if not candidate_scores:
+        if not avg_areas:
             return set()
 
+        median_area = float(np.median(list(avg_areas.values())))
+
+        # Teacher candidate must have area substantially larger than median student area (> 1.35x)
+        # and be present for a meaningful number of frames
+        candidates = [
+            tid for tid, area in avg_areas.items()
+            if area > median_area * 1.35 and len(track_history[tid]) >= 25
+        ]
+        if not candidates:
+            return set()
+
+        frame_diag = float(np.sqrt(frame_width**2 + frame_height**2)) if (frame_width and frame_height) else 1000.0
+        candidate_scores = []
+        for track_id in candidates:
+            separation = self._track_separation(track_id, avg_centers, frame_diag)
+            score = (avg_areas[track_id] / (median_area + 1e-3)) + (separation * 0.5)
+            candidate_scores.append((score, track_id))
+
         candidate_scores.sort(reverse=True)
-        top_score, top_track, center_x, center_y = candidate_scores[0]
+        top_score, top_track = candidate_scores[0]
         if top_score >= 1.8:
             return {top_track}
 
         return set()
 
-    def _track_separation(self, candidate_id: int, track_history: Dict[int, List[Tuple[float, float, float, float]]]) -> float:
-        """Compute average normalized separation of a track from other tracks."""
-        if candidate_id not in track_history:
-            return 0.0
-        candidate_centers = [((x1 + x2) / 2, (y1 + y2) / 2)
-                             for x1, y1, x2, y2 in track_history[candidate_id]]
-        if not candidate_centers:
+    def _track_separation(self, candidate_id: int, avg_centers: Dict[int, Tuple[float, float]], frame_diag: float) -> float:
+        """Compute average normalized separation of candidate centroid from other track centroids."""
+        if candidate_id not in avg_centers or len(avg_centers) <= 1:
             return 0.0
 
-        total_distance = 0.0
-        count = 0
-        for other_id, other_bboxes in track_history.items():
-            if other_id == candidate_id or not other_bboxes:
-                continue
-            other_centers = [((x1 + x2) / 2, (y1 + y2) / 2)
-                             for x1, y1, x2, y2 in other_bboxes]
-            for c in candidate_centers:
-                distances = [np.linalg.norm(
-                    np.array(c) - np.array(o)) for o in other_centers]
-                if distances:
-                    total_distance += min(distances)
-                    count += 1
-        if count == 0:
+        c_pt = np.array(avg_centers[candidate_id], dtype=np.float32)
+        other_pts = np.array([pt for tid, pt in avg_centers.items() if tid != candidate_id], dtype=np.float32)
+        if len(other_pts) == 0:
             return 0.0
-        return float(total_distance / count / max(1.0, np.mean([np.linalg.norm([x, y]) for x, y in candidate_centers])))
+
+        dists = np.linalg.norm(other_pts - c_pt, axis=1)
+        mean_dist = float(np.mean(dists))
+        return mean_dist / max(1.0, frame_diag)
 
     def _save_visualization(self, frames: List, all_frames_tracks: List, top_3: List, track_history: Dict, fps: float):
         """Save visualization of top-3 students."""
